@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      # Download Gradle 8.5 directly and prepend to PATH so system Gradle 9.x is not used.
+      - name: Install Gradle 8.5
+        run: |
+          wget -q https://services.gradle.org/distributions/gradle-8.5-bin.zip -O /tmp/gradle-8.5.zip
+          unzip -q /tmp/gradle-8.5.zip -d /opt
+          echo "/opt/gradle-8.5/bin" >> $GITHUB_PATH
+
+      - name: Diagnostics
+        run: |
+          echo "::notice title=Gradle Version::$(gradle --version 2>&1 | grep '^Gradle' | head -1)"
+          echo "::notice title=Gradle Path::$(which gradle)"
+          echo "::notice title=Java Version::$(java -version 2>&1 | head -1)"
+          echo "::notice title=Android Platforms::$(ls $ANDROID_HOME/platforms/ 2>/dev/null | tr '\n' ' ')"
+          echo "::notice title=Build Tools::$(ls $ANDROID_HOME/build-tools/ 2>/dev/null | tr '\n' ' ')"
+
+      - name: Configure Android SDK
+        run: echo "sdk.dir=$ANDROID_HOME" > local.properties
+
+      - name: Build
+        run: |
+          gradle assembleDebug 2>&1 | tee /tmp/build.log
+          GRADLE_EXIT=${PIPESTATUS[0]}
+          if [ $GRADLE_EXIT -ne 0 ]; then
+            sed -n '/^FAILURE:/,$p' /tmp/build.log | head -20 | while IFS= read -r line; do
+              echo "::error::${line:0:250}"
+            done
+            exit $GRADLE_EXIT
+          fi
+
+      - name: Run unit tests
+        run: gradle testDebugUnitTest -q
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Install Gradle 8.5
+        run: |
+          wget -q https://services.gradle.org/distributions/gradle-8.5-bin.zip -O /tmp/gradle-8.5.zip
+          unzip -q /tmp/gradle-8.5.zip -d /opt
+          echo "/opt/gradle-8.5/bin" >> $GITHUB_PATH
+
+      - name: Configure Android SDK
+        run: echo "sdk.dir=$ANDROID_HOME" > local.properties
+
+      - name: Build release
+        run: gradle assembleRelease
+
+      - name: Publish to GitHub Packages
+        run: gradle publish
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
