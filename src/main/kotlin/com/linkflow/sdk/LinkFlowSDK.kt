@@ -54,9 +54,27 @@ class LinkFlowSDK private constructor(
         private const val KEY_INSTALL_ID = "install_id"
         private const val KEY_INSTALL_TOKEN = "install_token"
         private const val KEY_LAST_RESULT = "last_attribution_result"
+        private const val KEY_CUSTOMER_USER_ID = "customer_user_id"
+        private const val KEY_PENDING_IDENTIFY = "pending_identify"
 
         /** Reported to the server as `sdkVersion`. Keep in step with the published artifact version. */
-        const val SDK_VERSION = "2.0.0"
+        const val SDK_VERSION = "2.1.0"
+
+        /** ISO-8601 UTC timestamp, as the server expects for `eventTimestamp`. */
+        internal fun isoUtc(millis: Long): String {
+            val format = java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US)
+            format.timeZone = TimeZone.getTimeZone("UTC")
+            return format.format(Date(millis))
+        }
+
+        /** Server-side DTO for [LinkFlowConsent]; only the granular, reported fields. */
+        internal fun consentJson(consent: LinkFlowConsent): JSONObject = JSONObject().apply {
+            consent.gdprApplies?.let { put("gdprApplies", it) }
+            consent.tcfString?.let { put("tcfString", it) }
+            consent.adUserData?.let { put("adUserData", it) }
+            consent.adPersonalization?.let { put("adPersonalization", it) }
+            put("analytics", consent.attribution)
+        }
 
         @Volatile
         private var instance: LinkFlowSDK? = null
@@ -210,11 +228,36 @@ class LinkFlowSDK private constructor(
             put("eventName", eventName)
             params?.let { put("eventParams", JSONObject(it)) }
             revenue?.let { put("revenue", it) }
+            // When it happened, not when it was finally delivered: queued
+            // offline events used to be stamped with their delivery time.
+            put("eventTimestamp", isoUtc(System.currentTimeMillis()))
+            getCustomerUserId()?.let { put("customerUserId", it) }
         }
 
         eventQueue.enqueue(payload)
         scope.launch { flushEventQueue() }
     }
+
+    /**
+     * Associates your own user id with this install (2.1.0+), e.g. after login.
+     *
+     * Sent with the attribution request when already set at first launch, with
+     * every later event, and bound to an existing install through
+     * `/api/attribution/identify` (retried on the next launch if offline). Pass
+     * null on logout to stop attaching it to new events; the server keeps the
+     * last bound id for the install.
+     */
+    fun setCustomerUserId(customerUserId: String?) {
+        val trimmed = customerUserId?.trim()?.takeIf { it.isNotEmpty() }
+        prefs.edit()
+            .putString(KEY_CUSTOMER_USER_ID, trimmed)
+            .putBoolean(KEY_PENDING_IDENTIFY, trimmed != null)
+            .apply()
+        if (trimmed != null) scope.launch { flushIdentify() }
+    }
+
+    /** The customer user id last passed to [setCustomerUserId], if any. */
+    fun getCustomerUserId(): String? = prefs.getString(KEY_CUSTOMER_USER_ID, null)
 
     /** The most recent attribution result, restored from disk if needed. */
     fun getAttributionResult(): AttributionResult? {
@@ -263,6 +306,8 @@ class LinkFlowSDK private constructor(
                 clickToken?.let { put("clickToken", it) }
 
                 put("deviceFingerprint", buildDeviceFingerprint())
+                getCustomerUserId()?.let { put("customerUserId", it) }
+                consent?.takeIf { it.hasGranularSignals() }?.let { put("consent", consentJson(it)) }
                 put("appVersion", getAppVersion())
                 put("osVersion", Build.VERSION.RELEASE)
                 put("deviceModel", "${Build.MANUFACTURER} ${Build.MODEL}".trim())
@@ -314,6 +359,8 @@ class LinkFlowSDK private constructor(
                 .putString(KEY_INSTALL_ID, installId)
                 .putString(KEY_INSTALL_TOKEN, installToken)
                 .putString(KEY_LAST_RESULT, response.toString())
+                // The resolve request already carried the id, if one was set.
+                .putBoolean(KEY_PENDING_IDENTIFY, false)
                 .apply()
         }
 
@@ -345,7 +392,35 @@ class LinkFlowSDK private constructor(
     // Event delivery
     // ------------------------------------------------------------------------
 
+    /** Binds a pending customer user id to the attributed install, if both exist. */
+    private suspend fun flushIdentify() {
+        if (!prefs.getBoolean(KEY_PENDING_IDENTIFY, false)) return
+        val id = installId ?: prefs.getString(KEY_INSTALL_ID, null) ?: return
+        val customerUserId = getCustomerUserId() ?: return
+        val granted = consent
+        if (granted == null || !granted.attribution) return
+
+        val payload = JSONObject().apply {
+            put("installId", id)
+            put("customerUserId", customerUserId)
+            installToken?.let { put("installToken", it) }
+        }
+        when (val outcome = http.send(
+            "${config.apiBaseUrl}/api/attribution/identify", "POST",
+            payload.toString(), config.appKey,
+        )) {
+            is HttpOutcome.Success -> prefs.edit().putBoolean(KEY_PENDING_IDENTIFY, false).apply()
+            // A 404 means a pre-2.1 server: nothing to retry against, stop asking.
+            is HttpOutcome.PermanentFailure -> {
+                log("Identify rejected (HTTP ${outcome.code}); not retrying")
+                prefs.edit().putBoolean(KEY_PENDING_IDENTIFY, false).apply()
+            }
+            is HttpOutcome.TransientFailure -> log("Identify deferred; will retry on next launch")
+        }
+    }
+
     private suspend fun flushEventQueue() {
+        flushIdentify()
         val id = installId ?: prefs.getString(KEY_INSTALL_ID, null)
         if (id == null) {
             if (eventQueue.size() > 0) {
@@ -518,7 +593,7 @@ class LinkFlowSDK private constructor(
      */
     private fun redact(payload: JSONObject): String {
         val copy = JSONObject(payload.toString())
-        for (key in listOf("advertisingId", "installReferrer", "clickToken", "installToken")) {
+        for (key in listOf("advertisingId", "installReferrer", "clickToken", "installToken", "customerUserId")) {
             if (copy.has(key)) copy.put(key, "«redacted»")
         }
         return copy.toString()

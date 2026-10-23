@@ -51,10 +51,30 @@ data class LinkFlowConfig @JvmOverloads constructor(
     }
 }
 
-/** User consent state. */
-data class LinkFlowConsent(
+/**
+ * User consent state.
+ *
+ * The granular fields (2.1.0+) are forwarded to the server with the attribution
+ * request so downstream partner forwarding can honour them (GDPR / TCF v2 and
+ * Google consent mode v2 under the EU DMA). Each is optional: null means "not
+ * reported", which the server records as such. Existing two-argument call sites
+ * — Kotlin and Java — keep compiling unchanged.
+ */
+data class LinkFlowConsent @JvmOverloads constructor(
     /** Permits attribution resolution and event reporting. */
     val attribution: Boolean,
     /** Permits reading the advertising identifier. */
     val advertisingId: Boolean = attribution,
-)
+    /** True when the user is subject to GDPR / the DMA. */
+    val gdprApplies: Boolean? = null,
+    /** IAB TCF v2 consent string from your CMP, if any. */
+    val tcfString: String? = null,
+    /** Google consent mode v2 `ad_user_data`. */
+    val adUserData: Boolean? = null,
+    /** Google consent mode v2 `ad_personalization`. */
+    val adPersonalization: Boolean? = null,
+) {
+    /** True when any granular signal was supplied, i.e. worth sending. */
+    internal fun hasGranularSignals(): Boolean =
+        gdprApplies != null || tcfString != null || adUserData != null || adPersonalization != null
+}

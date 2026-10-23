@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.0] - 2026-10-14
+
+### Added
+- `setCustomerUserId(id)` / `getCustomerUserId()`: binds your own user id to the
+  install (sent with the attribution request, every event, and via
+  `/api/attribution/identify` after login; retried on the next launch if offline).
+- Granular consent signals on `LinkFlowConsent`: `gdprApplies`, `tcfString`
+  (IAB TCF v2), `adUserData` and `adPersonalization` (Google consent mode v2 /
+  EU DMA). Forwarded with the attribution request when supplied.
+- Events carry `eventTimestamp`, the time they happened on the device. Events
+  queued offline were previously stamped with their delivery time.
+
+### Compatibility
+- **Fully backward compatible.** Every 2.0 call site compiles and behaves the
+  same; all additions are optional. The SDK still works against servers that
+  predate 2.1: the extra request fields are ignored, and a 404 from
+  `/api/attribution/identify` stops the retry instead of looping.
+- Older SDK builds keep working against the 2.1 server: it accepts the 1.x and
+  2.0 payload shapes unchanged (pinned by server contract tests).
+
 ## [2.0.0] - 2026-08-05
 
 ### Fixed

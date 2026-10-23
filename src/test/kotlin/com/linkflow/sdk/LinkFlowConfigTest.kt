@@ -94,3 +94,27 @@ class InstallReferrerFormatTest {
         assertEquals("a&b=c", parsed["utm_source"])
     }
 }
+
+/** 2.1.0 additions. The two-argument consent shape must keep working unchanged. */
+class LinkFlowConsent21Test {
+
+    @Test
+    fun `legacy two argument consent has no granular signals`() {
+        val consent = LinkFlowConsent(true, false)
+        assertFalse(consent.hasGranularSignals())
+        assertNull(consent.tcfString)
+        assertNull(consent.adUserData)
+    }
+
+    @Test
+    fun `granular consent signals are detected`() {
+        assertTrue(LinkFlowConsent(attribution = true, adPersonalization = false).hasGranularSignals())
+        assertTrue(LinkFlowConsent(attribution = true, tcfString = "CP-x").hasGranularSignals())
+    }
+
+    @Test
+    fun `event timestamps are ISO-8601 UTC`() {
+        assertEquals("1970-01-01T00:00:00.000Z", LinkFlowSDK.isoUtc(0))
+        assertEquals("2026-01-02T03:04:05.006Z", LinkFlowSDK.isoUtc(1767323045006))
+    }
+}

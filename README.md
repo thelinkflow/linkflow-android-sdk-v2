@@ -16,7 +16,7 @@ Add the SDK to your app's `build.gradle`:
 
 ```gradle
 dependencies {
-    implementation 'com.linkflow:android-sdk:1.0.0'
+    implementation 'com.linkflow:android-sdk:2.1.0'
     implementation 'com.android.installreferrer:installreferrer:2.2'
     implementation 'com.google.android.gms:play-services-ads-identifier:18.0.1'
 }
@@ -222,6 +222,29 @@ class ShopActivity : AppCompatActivity() {
     }
 }
 ```
+
+## What's new in 2.1
+
+```kotlin
+// Bind your own user id after login (null on logout).
+LinkFlowSDK.getInstance().setCustomerUserId("user-123")
+
+// Granular consent (GDPR / TCF v2, Google consent mode v2). All optional.
+LinkFlowSDK.getInstance().setConsent(
+    LinkFlowConsent(
+        attribution = true,
+        advertisingId = false,
+        gdprApplies = true,
+        tcfString = cmp.tcString,
+        adUserData = true,
+        adPersonalization = false,
+    )
+)
+```
+
+Events now record when they happened on the device (`eventTimestamp`), so
+revenue queued while offline lands on the right day. All 2.0 code keeps working
+unchanged, and older SDK versions keep working against the current server.
 
 ## Event Tracking
 
