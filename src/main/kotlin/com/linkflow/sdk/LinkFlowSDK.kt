@@ -46,6 +46,14 @@ class LinkFlowSDK private constructor(
     @Volatile private var hasPendingLaunch = false
     @Volatile private var consent: LinkFlowConsent? = null
 
+    /** 2.2.0+: deep links queued while the host app holds delivery. Not held by default. */
+    private val heldDeepLinks = DeepLinkHoldQueue<HeldDeepLink>()
+
+    private sealed class HeldDeepLink {
+        data class Deferred(val result: AttributionResult) : HeldDeepLink()
+        data class Direct(val uri: Uri) : HeldDeepLink()
+    }
+
     companion object {
         private const val TAG = "LinkFlow"
         private const val PREFS = "linkflow_prefs"
@@ -56,9 +64,12 @@ class LinkFlowSDK private constructor(
         private const val KEY_LAST_RESULT = "last_attribution_result"
         private const val KEY_CUSTOMER_USER_ID = "customer_user_id"
         private const val KEY_PENDING_IDENTIFY = "pending_identify"
+        private const val KEY_LAST_RESOLVE_AT = "last_resolve_at"
+        private const val KEY_LAST_RESOLVE_RESULT = "last_resolve_result"
+        private const val KEY_LAST_MATCH_METHOD = "last_match_method"
 
         /** Reported to the server as `sdkVersion`. Keep in step with the published artifact version. */
-        const val SDK_VERSION = "2.1.0"
+        const val SDK_VERSION = "2.2.0"
 
         /** ISO-8601 UTC timestamp, as the server expects for `eventTimestamp`. */
         internal fun isoUtc(millis: Long): String {
@@ -276,6 +287,89 @@ class LinkFlowSDK private constructor(
     fun pendingEventCount(): Int = eventQueue.size()
 
     // ------------------------------------------------------------------------
+    // Deep link hold / release (2.2.0+)
+    // ------------------------------------------------------------------------
+
+    /**
+     * Holds deep-link delivery until [releaseDeepLinks] is called, e.g. while a
+     * splash screen, onboarding or login is showing and the app cannot navigate.
+     *
+     * While held, a deferred deep link (an attributed [AttributionResult] that
+     * carries a link, normally delivered to `onAttributionResolved`) and direct
+     * deep links (`onDeepLinkReceived`) are queued instead of delivered. The
+     * queue is bounded: only the latest of each kind is kept. Attribution itself,
+     * events and [getAttributionResult] are unaffected.
+     *
+     * Not held by default, so apps that never call this behave exactly as before.
+     */
+    fun holdDeepLinks() {
+        heldDeepLinks.hold()
+        log("Deep link delivery held")
+    }
+
+    /** Stops holding and delivers what was queued, in arrival order. Safe to call when not held. */
+    fun releaseDeepLinks() {
+        val queued = heldDeepLinks.release()
+        log("Deep link delivery released (${queued.size} queued)")
+        if (queued.isEmpty()) return
+        scope.launch {
+            for (item in queued) {
+                when (item) {
+                    is HeldDeepLink.Deferred -> deliverResolved(item.result)
+                    is HeldDeepLink.Direct -> deliverDeepLink(item.uri)
+                }
+            }
+        }
+    }
+
+    /** True between [holdDeepLinks] and [releaseDeepLinks]. */
+    fun isHoldingDeepLinks(): Boolean = heldDeepLinks.isHeld
+
+    // ------------------------------------------------------------------------
+    // Diagnostics (2.2.0+)
+    // ------------------------------------------------------------------------
+
+    /**
+     * A support snapshot of the SDK's state: version, API host, consent, whether
+     * an install id exists, the last attribution outcome, queued events and held
+     * deep links. Contains no identifiers or personal data, so it is safe to log
+     * or attach to a support ticket.
+     */
+    fun getDiagnostics(): LinkFlowDiagnostics {
+        val granted = consent
+        val lastAt = prefs.getLong(KEY_LAST_RESOLVE_AT, 0L).takeIf { it > 0L }
+        return LinkFlowDiagnostics(
+            sdkVersion = SDK_VERSION,
+            apiHost = LinkFlowDiagnostics.hostOf(config.apiBaseUrl),
+            appKeyConfigured = !config.appKey.isNullOrBlank(),
+            consentState = LinkFlowDiagnostics.consentState(config.requireConsent, granted),
+            advertisingIdConsent = granted?.advertisingId,
+            launchPendingConsent = hasPendingLaunch,
+            hasInstallId = (installId ?: prefs.getString(KEY_INSTALL_ID, null)) != null,
+            hasInstallToken = (installToken ?: prefs.getString(KEY_INSTALL_TOKEN, null)) != null,
+            customerUserIdSet = getCustomerUserId() != null,
+            attributionComplete = prefs.getBoolean(KEY_ATTRIBUTION_COMPLETE, false),
+            lastResolveAtMillis = lastAt,
+            lastResolveResult = ResolveResultCategory.fromWireName(prefs.getString(KEY_LAST_RESOLVE_RESULT, null)),
+            lastMatchMethod = prefs.getString(KEY_LAST_MATCH_METHOD, null),
+            queuedEventCount = eventQueue.size(),
+            deepLinksHeld = heldDeepLinks.isHeld,
+            heldDeepLinkCount = heldDeepLinks.size(),
+            attributionCallbackSet = attributionCallback != null,
+        )
+    }
+
+    private fun recordResolveOutcome(category: ResolveResultCategory, matchMethod: String? = null) {
+        val editor = prefs.edit()
+            .putLong(KEY_LAST_RESOLVE_AT, System.currentTimeMillis())
+            .putString(KEY_LAST_RESOLVE_RESULT, category.wireName)
+        if (category == ResolveResultCategory.ATTRIBUTED || category == ResolveResultCategory.ORGANIC) {
+            editor.putString(KEY_LAST_MATCH_METHOD, matchMethod)
+        }
+        editor.apply()
+    }
+
+    // ------------------------------------------------------------------------
     // Attribution
     // ------------------------------------------------------------------------
 
@@ -320,19 +414,29 @@ class LinkFlowSDK private constructor(
                 "${config.apiBaseUrl}/api/attribution/resolve", "POST",
                 requestData.toString(), config.appKey,
             )) {
-                is HttpOutcome.Success -> handleResolveSuccess(JSONObject(outcome.body))
+                is HttpOutcome.Success -> {
+                    val json = try {
+                        JSONObject(outcome.body)
+                    } catch (e: Exception) {
+                        recordResolveOutcome(ResolveResultCategory.INVALID_RESPONSE)
+                        throw e
+                    }
+                    handleResolveSuccess(json)
+                }
 
                 is HttpOutcome.PermanentFailure -> {
                     // A 4xx will never succeed. Stop retrying on future launches so
                     // we do not hit the server forever, but surface the error.
                     logError("Attribution rejected (HTTP ${outcome.code}); not retrying", null)
                     prefs.edit().putBoolean(KEY_ATTRIBUTION_COMPLETE, true).apply()
+                    recordResolveOutcome(ResolveResultCategory.REJECTED)
                     notifyResolved(AttributionResult(attributed = false))
                 }
 
                 is HttpOutcome.TransientFailure -> {
                     // Leave the flag unset so the next launch tries again.
                     logError("Attribution could not be delivered; will retry on next launch", outcome.error)
+                    recordResolveOutcome(ResolveResultCategory.NETWORK_ERROR)
                     notifyError(outcome.error ?: IllegalStateException("Attribution request failed"))
                 }
             }
@@ -346,12 +450,12 @@ class LinkFlowSDK private constructor(
         // Only now is the attribution genuinely complete.
         prefs.edit().putBoolean(KEY_ATTRIBUTION_COMPLETE, true).apply()
 
-        val attributed = response.optBoolean("attributed", false)
+        val parsed = ParsedResolveResponse.parse(response)
 
-        if (attributed) {
-            installId = response.stringOrNull("installId")
+        if (parsed.attributed) {
+            installId = parsed.installId
             // Returned once, at creation. Authenticates subsequent event calls.
-            response.stringOrNull("installToken")?.let {
+            parsed.installToken?.let {
                 installToken = it
             }
 
@@ -362,26 +466,50 @@ class LinkFlowSDK private constructor(
                 // The resolve request already carried the id, if one was set.
                 .putBoolean(KEY_PENDING_IDENTIFY, false)
                 .apply()
+        } else if (parsed.installId != null) {
+            // 2.2 servers also create an install for organic (unmatched) users and
+            // return its id and token, so organic users can report events, revenue
+            // and identify. Older servers return neither, and nothing changes.
+            installId = parsed.installId
+            parsed.installToken?.let { installToken = it }
+            prefs.edit()
+                .putString(KEY_INSTALL_ID, installId)
+                .putString(KEY_INSTALL_TOKEN, installToken)
+                .apply()
         }
 
-        val result = parseAttributionResult(response)
+        recordResolveOutcome(parsed.category, parsed.match?.method)
+
+        val result = toAttributionResult(parsed)
         lastResult = result
-        log("Attribution resolved: attributed=${result.attributed} method=${result.attributionMethod}")
+        log("Attribution resolved: attributed=${result.attributed} method=${result.attributionMethod} match=${parsed.match?.method}")
         notifyResolved(result)
     }
 
-    private fun parseAttributionResult(response: JSONObject): AttributionResult = AttributionResult(
-        attributed = response.optBoolean("attributed", false),
-        deepLinkValue = response.stringOrNull("deepLinkValue"),
-        deepLinkParams = response.optJSONObject("deepLinkParams")?.toMap() ?: emptyMap(),
-        campaignData = response.optJSONObject("campaignData")?.toMap() ?: emptyMap(),
-        attributionMethod = response.stringOrNull("attributionMethod"),
-        confidence = if (response.has("confidence")) response.optDouble("confidence") else null,
-        isReinstall = response.optBoolean("isReinstall", false),
+    private fun parseAttributionResult(response: JSONObject): AttributionResult =
+        toAttributionResult(ParsedResolveResponse.parse(response))
+
+    private fun toAttributionResult(parsed: ParsedResolveResponse): AttributionResult = AttributionResult(
+        attributed = parsed.attributed,
+        deepLinkValue = parsed.deepLinkValue,
+        deepLinkParams = parsed.deepLinkParams,
+        campaignData = parsed.campaignData,
+        attributionMethod = parsed.attributionMethod,
+        confidence = parsed.confidence,
+        isReinstall = parsed.isReinstall,
+        match = parsed.match,
     )
 
     private suspend fun handleDeepLinkInternal(uri: Uri?) {
         if (uri == null) return
+        if (heldDeepLinks.offer(DeepLinkKind.DIRECT, HeldDeepLink.Direct(uri))) {
+            log("Deep link held until releaseDeepLinks()")
+            return
+        }
+        deliverDeepLink(uri)
+    }
+
+    private suspend fun deliverDeepLink(uri: Uri) {
         log("Handling deep link: $uri")
         withContext(Dispatchers.Main) {
             attributionCallback?.onDeepLinkReceived(uri)
@@ -565,7 +693,17 @@ class LinkFlowSDK private constructor(
     // Callbacks and logging
     // ------------------------------------------------------------------------
 
-    private suspend fun notifyResolved(result: AttributionResult) = withContext(Dispatchers.Main) {
+    private suspend fun notifyResolved(result: AttributionResult) {
+        if (result.carriesDeepLink() &&
+            heldDeepLinks.offer(DeepLinkKind.DEFERRED, HeldDeepLink.Deferred(result))
+        ) {
+            log("Deferred deep link held until releaseDeepLinks()")
+            return
+        }
+        deliverResolved(result)
+    }
+
+    private suspend fun deliverResolved(result: AttributionResult) = withContext(Dispatchers.Main) {
         runCatching { attributionCallback?.onAttributionResolved(result) }
             .onFailure { logError("Attribution callback threw", it) }
     }
@@ -776,7 +914,17 @@ class LinkFlowSDK private constructor(
         val isReinstall: Boolean = false,
         /** Rewards attached to the clicked link. */
         val rewards: List<Reward> = emptyList(),
-    )
+        /**
+         * 2.2.0+: how the server matched the install, when it reports a `match`
+         * object (null against older servers). `method` is one of
+         * install_referrer, click_token, advertising_id, probabilistic or organic.
+         */
+        val match: AttributionMatch? = null,
+    ) {
+        /** An attributed result that carries a deferred deep link payload. */
+        fun carriesDeepLink(): Boolean =
+            attributed && (deepLinkValue != null || deepLinkParams.isNotEmpty())
+    }
 
     interface AttributionCallback {
         fun onAttributionResolved(result: AttributionResult)

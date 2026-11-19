@@ -16,7 +16,7 @@ Add the SDK to your app's `build.gradle`:
 
 ```gradle
 dependencies {
-    implementation 'com.linkflow:android-sdk:2.1.0'
+    implementation 'com.linkflow:android-sdk:2.2.0'
     implementation 'com.android.installreferrer:installreferrer:2.2'
     implementation 'com.google.android.gms:play-services-ads-identifier:18.0.1'
 }
@@ -222,6 +222,55 @@ class ShopActivity : AppCompatActivity() {
     }
 }
 ```
+
+## What's new in 2.2
+
+### Hold deep links until the app can navigate
+
+```kotlin
+// e.g. in Application.onCreate, before handleAppLaunch()
+LinkFlowSDK.getInstance().holdDeepLinks()
+
+// ...later, once onboarding / login / your nav graph is ready:
+LinkFlowSDK.getInstance().releaseDeepLinks()
+```
+
+While held, a deferred deep link (an attributed result carrying a link,
+delivered to `onAttributionResolved`) and direct deep links
+(`onDeepLinkReceived`) are queued and delivered on release. Only the latest of
+each kind is kept. Attribution, events and `getAttributionResult()` are not
+affected. Not held by default.
+
+### Organic installs and match info
+
+Servers from 2.2 return an install id and token for organic (unmatched)
+installs too. The SDK stores them, so events, revenue and `setCustomerUserId`
+now work for organic users. With older servers nothing changes.
+
+`AttributionResult.match` (nullable) reports how the server matched the
+install, when it sends a `match` object:
+
+```kotlin
+result.match?.method      // install_referrer | click_token | advertising_id | probabilistic | organic
+result.match?.confidence  // 0.0–1.0, nullable
+```
+
+### Diagnostics
+
+```kotlin
+Log.d("LinkFlow", LinkFlowSDK.getInstance().getDiagnostics().toMap().toString())
+```
+
+This returns the SDK version, API host, whether an app key is configured,
+consent state, whether an install id/token exist, the time and category of the
+last attribution request (`attributed`, `organic`, `rejected`,
+`network_error`, `invalid_response`), the match method, queued event count, and
+hold state. It includes no identifiers or personal data, so it is safe to
+attach to a support ticket.
+
+**Why didn't my deep link fire?** Check `deepLinksHeld` (call
+`releaseDeepLinks()`), `consentState` (`pending` buffers the launch until
+`setConsent`), `attributionCallbackSet`, and `lastResolveResult`.
 
 ## What's new in 2.1
 
